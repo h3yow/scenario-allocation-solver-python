@@ -32,6 +32,28 @@ class OptimizeRequest(BaseModel):
     solver_step_delay: float = Field(default=0.0, ge=0)
 
 
+class ConfirmedAllocationIn(BaseModel):
+    """一条已确认（锁定、不可挪动）的额度：某场景下实体在某窗口上的量。"""
+
+    scenario: str
+    entity: str
+    window: str
+    amount: float = Field(gt=0)
+
+
+class ReplanRequest(BaseModel):
+    """带已确认额度的重规划：接着 ``based_on_key`` 的成功方案继续做。"""
+
+    based_on_key: str = Field(min_length=1)
+    entities: list[EntityIn]
+    windows: list[WindowIn]
+    scenarios: list[ScenarioIn]
+    confirmed_allocations: list[ConfirmedAllocationIn] = Field(default_factory=list)
+    timeout_seconds: float | None = Field(default=None, gt=0)
+    quantize_decimals: int = Field(default=9, ge=0, le=12)
+    solver_step_delay: float = Field(default=0.0, ge=0)
+
+
 class EntityOut(BaseModel):
     entity: str
     demand: float
@@ -52,6 +74,7 @@ class ScenarioOut(BaseModel):
     total_supply: float
     total_demand: float
     total_allocated: float
+    confirmed_total: float = 0.0
     feasible: bool
     infeasibility_reasons: list[str]
     entity_allocations: list[EntityOut]
@@ -64,4 +87,5 @@ class OptimizeResponse(BaseModel):
     solver_version: str
     request_fingerprint: str
     quantize_decimals: int
+    based_on_key: str | None = None
     scenarios: list[ScenarioOut]

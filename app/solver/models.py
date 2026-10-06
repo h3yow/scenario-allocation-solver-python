@@ -40,6 +40,16 @@ class AllocationProblem:
 
 
 @dataclass(frozen=True)
+class ConfirmedCell:
+    """已确认额度：scenario 下 entity 在 window 上必须原样保留的量。"""
+
+    scenario: str
+    entity: str
+    window: str
+    amount: float
+
+
+@dataclass(frozen=True)
 class EntityAllocation:
     entity: str
     demand: float
@@ -66,6 +76,8 @@ class ScenarioResult:
     window_allocations: list[WindowAllocation]
     feasible: bool
     infeasibility_reasons: list[str]
+    confirmed_total: float = 0.0
+    confirmed_cells: tuple[ConfirmedCell, ...] = ()
 
 
 @dataclass(frozen=True)

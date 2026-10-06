@@ -10,6 +10,7 @@ class ErrorCode:
     INVALID_REQUEST = "INVALID_REQUEST"
     INFEASIBLE = "INFEASIBLE"
     CONFLICT = "CONFLICT"
+    CONFIRMED_CONFLICT = "CONFIRMED_CONFLICT"
     TIMEOUT = "TIMEOUT"
     CANCELLED = "CANCELLED"
     SOLVER_FAILURE = "SOLVER_FAILURE"
@@ -42,6 +43,13 @@ class InfeasibleError(AppError):
 class ConflictError(AppError):
     code = ErrorCode.CONFLICT
     http_status = 409
+
+
+class ConfirmedConflictError(AppError):
+    """已确认额度与最新输入冲突（区别于参数非法与整体不可行）。"""
+
+    code = ErrorCode.CONFIRMED_CONFLICT
+    http_status = 412
 
 
 class TimeoutError(AppError):  # noqa: A001 - 领域语义明确，覆盖内建名

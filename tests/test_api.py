@@ -217,3 +217,110 @@ def test_concurrent_duplicate_posts_single_solve(client) -> None:
     assert set(statuses) <= {202, 200}
     logger.info("提交状态码分布=%s，最终单一成功结果",
                 {code: statuses.count(code) for code in set(statuses)})
+
+
+def test_replan_endpoint_preserves_locks_and_tracks_lineage(client) -> None:
+    logger.info("=== API：带确认额度的重规划端到端 ===")
+    req = make_request(
+        scenarios=[
+            ScenarioIn(name="base", total_supply=120, is_baseline=True),
+            ScenarioIn(name="up", total_supply=100,
+                       demand_multipliers={"a": 1.5}),
+        ]
+    ).model_dump()
+
+    # 1) 先有一份成功的基础方案 plan-base。
+    client.post("/optimizations", json=req,
+                headers={"Idempotency-Key": "plan-base"})
+    _, base = _poll(client, "plan-base")
+    assert base["status"] == "SUCCEEDED"
+    # 基础方案里 w0 上 a 的实发量（工厂顺序：w0 先被填充）。
+    w0 = next(w for w in base["scenarios"][0]["window_allocations"]
+              if w["window"] == "w0")
+    issued_a = w0["entities"]["a"]
+    logger.info("基础方案 base/w0/a 实发量=%s，取其中 30 作为确认额度", issued_a)
+    assert issued_a >= 30
+
+    # 2) 提交重规划：确认 base 场景 a@w0=30。
+    replan_req = dict(req)
+    replan_req["based_on_key"] = "plan-base"
+    replan_req["confirmed_allocations"] = [
+        {"scenario": "base", "entity": "a", "window": "w0", "amount": 30.0}
+    ]
+    r = client.post("/replans", json=replan_req,
+                    headers={"Idempotency-Key": "plan-replan"})
+    assert r.status_code in (200, 202)
+    final, body = _poll(client, "plan-replan")
+    assert final.status_code == 200
+    assert body["status"] == "SUCCEEDED"
+    assert body["based_on_key"] == "plan-base", "响应必须能看出接续来源"
+
+    # 3) 逐格核对：锁定格子原样保留，其余约束严格成立。
+    for s in body["scenarios"]:
+        tol = 2e-6
+        assert abs(s["total_allocated"] - s["total_supply"]) <= tol
+        for w in s["window_allocations"]:
+            assert w["allocated"] <= w["capacity"] + tol
+        for e in s["entity_allocations"]:
+            assert e["amount"] >= e["min_share"] - tol
+            assert e["amount"] <= e["demand"] + tol
+    s0 = body["scenarios"][0]
+    locked = next(
+        w for w in s0["window_allocations"] if w["window"] == "w0"
+    )["entities"]["a"]
+    assert locked == 30.0
+    assert s0["confirmed_total"] == 30.0
+    logger.info("判定依据：锁定格 a@w0=%s 精确保留，confirmed_total=%s，"
+                "based_on_key=%s", locked, s0["confirmed_total"],
+                body["based_on_key"])
+
+    # 4) 重复提交幂等返回同一份；不同内容同键 409。
+    dup = client.post("/replans", json=replan_req,
+                      headers={"Idempotency-Key": "plan-replan"})
+    assert dup.status_code == 200 and dup.json() == body
+
+    conflict_body = dict(replan_req)
+    conflict_body["confirmed_allocations"] = []
+    rc = client.post("/replans", json=conflict_body,
+                     headers={"Idempotency-Key": "plan-replan"})
+    assert rc.status_code == 409
+    logger.info("判定依据：重规划重复提交幂等、不同内容同键 409")
+
+    # 5) 确认额度与最新输入冲突 -> 轮询得到 412 类错误。
+    shrunk = dict(req)
+    shrunk["windows"] = [
+        {"name": "w0", "capacity": 10.0},
+        {"name": "w1", "capacity": 200.0},
+    ]
+    shrunk["based_on_key"] = "plan-base"
+    shrunk["confirmed_allocations"] = [
+        {"scenario": "base", "entity": "a", "window": "w0", "amount": 30.0}
+    ]
+    client.post("/replans", json=shrunk,
+                headers={"Idempotency-Key": "plan-replan-bad"})
+    _, bad = _poll(client, "plan-replan-bad")
+    assert bad["status"] == "FAILED"
+    assert bad["error"]["code"] == "CONFIRMED_CONFLICT"
+    logger.info("判定依据：窗口装不下 -> CONFIRMED_CONFLICT(412) 原因=%s",
+                bad["error"]["details"]["reasons"])
+
+    # 6) 接续目标缺失 -> 404；确认超过实发量 -> 400。
+    missing = dict(replan_req, based_on_key="nope")
+    r404 = client.post("/replans", json=missing,
+                       headers={"Idempotency-Key": "plan-replan-404"})
+    assert r404.status_code == 404
+    over = dict(replan_req)
+    over["confirmed_allocations"] = [
+        {"scenario": "base", "entity": "a", "window": "w0",
+         "amount": issued_a + 100}
+    ]
+    r400 = client.post("/replans", json=over,
+                       headers={"Idempotency-Key": "plan-replan-400"})
+    assert r400.status_code == 400
+    assert r400.json()["error"]["code"] == "INVALID_REQUEST"
+    logger.info("判定依据：接续缺失 404、确认超实发量 400")
+
+    # 7) 原方案没有被重规划改写。
+    _, base_again = _poll(client, "plan-base")
+    assert base_again == base
+    logger.info("判定依据：重规划后 plan-base 响应保持不变")

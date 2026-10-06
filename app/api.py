@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 
 from app.errors import AppError, ConflictError, NotFoundError
 from app.logging_setup import get_logger
-from app.models import OptimizeRequest, OptimizeResponse
+from app.models import OptimizeRequest, OptimizeResponse, ReplanRequest
 from app.service.idempotency import JobStatus
 from app.service.optimizer import OptimizerService
 
@@ -70,6 +70,35 @@ def build_router(service: OptimizerService) -> APIRouter:
     def get_optimization(key: str):
         record = service.get_result(key)
         return _record_response(record)
+
+    @router.post("/replans", response_model=OptimizeResponse)
+    def submit_replan(
+        payload: ReplanRequest,
+        idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    ):
+        """带已确认额度的重规划：接续一份既有成功方案，只重排未确认部分。"""
+        try:
+            outcome = service.submit_replan(idempotency_key.strip(), payload)
+        except ConflictError:
+            raise
+        record = outcome.record
+        if record.status is JobStatus.SUCCEEDED and record.result is not None:
+            logger.info(
+                "重规划幂等命中 key=%s based_on=%s 返回既有结果",
+                idempotency_key, payload.based_on_key,
+            )
+            return record.result
+
+        return JSONResponse(
+            status_code=202,
+            content={
+                "idempotency_key": record.key,
+                "status": record.status.value,
+                "request_fingerprint": record.fingerprint,
+                "based_on_key": payload.based_on_key,
+                "message": "重规划作业已受理，使用 GET 查询结果",
+            },
+        )
 
     @router.post("/optimizations/{key}/cancel")
     def cancel_optimization(key: str):

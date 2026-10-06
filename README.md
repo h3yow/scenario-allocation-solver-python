@@ -4,9 +4,14 @@
 正常 / 不可行 / 并发重复提交 / 求解超时 / 主动取消等情况下，都得到
 一致、可复现、可解释的结果。纯本地运行，不依赖外部优化求解器。
 
+并支持**带已确认额度的重规划（replan）**：方案部分额度确认下发后，
+需求或窗口容量变动时，只重排未确认部分，已发出的额度逐格原样锁定、
+不可挪动；重规划整体成功或明确失败，绝不偷偷改锁来凑结果。
+
 - Web 框架：FastAPI（Pydantic v2）
 - Python：>=3.14.4，依赖管理：uv
 - 求解：确定性两步法（实体水位填充 + 窗口整数网格装箱），无第三方求解器
+- 重规划：残量运输用确定性下界最大流（禁格可行），见 `app/solver/replan.py`
 
 ---
 
@@ -96,6 +101,8 @@ demand_s(e) = base_demand(e) * demand_multipliers_s.get(e, 1.0)
 - 同键 + 不同指纹：`409 CONFLICT`，既有作业与结果不受影响（作业处于
   RUNNING/SUCCEEDED/FAILED 任一状态都一样）。
 - 并发安全由 `IdempotencyStore` 的单一锁保证：登记与状态迁移在同一临界区。
+- 带已确认额度的重规划（`POST /replans`）走**同一套**键、同一把锁、同一
+  状态机与失败重试语义；重规划指纹额外包含确认额度与 `based_on_key`。
 
 ---
 
@@ -103,13 +110,14 @@ demand_s(e) = base_demand(e) * demand_multipliers_s.get(e, 1.0)
 
 | code | HTTP | 触发条件 | 可重试 |
 | --- | --- | --- | --- |
-| `INVALID_REQUEST` | 400 | 结构/取值非法（空实体、重名、非唯一基线、负值、未知实体引用、量化网格不可行等） | 修改输入 |
+| `INVALID_REQUEST` | 400 | 结构/取值非法（空实体、重名、非唯一基线、负值、未知实体引用、确认额度非法、量化网格不可行等） | 修改输入 |
 | `INFEASIBLE` | 422 | 输入合法但优化不可行，`details.reasons` 列出每条原因 | 修改输入 |
 | `CONFLICT` | 409 | 同幂等键绑定了不同请求指纹 | 更换键或保持同体 |
+| `CONFIRMED_CONFLICT` | 412 | 重规划：已确认额度与最新输入直接冲突（窗口装不下/实体超当前上限/确认总量超供给） | 修改确认额度或输入 |
 | `TIMEOUT` | 504 | 求解超过 `timeout_seconds` | 同键同指纹可重试 |
 | `CANCELLED` | 499 | 作业在运行中被主动取消 | 同键同指纹可重试 |
 | `SOLVER_FAILURE` | 500 | 求解器内部错误（含结果未通过内部约束校验） | 同键同指纹可重试 |
-| `NOT_FOUND` | 404 | 查询/取消不存在的作业 | — |
+| `NOT_FOUND` | 404 | 查询/取消不存在的作业，或重规划接续的方案不存在 | — |
 
 - **参数非法（400）在登记前同步拒绝**，不产生作业、不占用幂等键；
 - **不可行（422）属于合法输入的优化结果**，作业落 FAILED 并附原因；
@@ -143,8 +151,9 @@ demand_s(e) = base_demand(e) * demand_multipliers_s.get(e, 1.0)
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/optimizations`（头 `Idempotency-Key`） | 提交；首次 202，已完成的重复提交 200 |
-| GET | `/optimizations/{key}` | 查询；RUNNING→202，SUCCEEDED→200，FAILED→200 带 error |
-| POST | `/optimizations/{key}/cancel` | 请求取消；运行中 202，否则 200 |
+| POST | `/replans`（头 `Idempotency-Key`） | 带已确认额度的重规划；接续 `based_on_key` 的成功方案 |
+| GET | `/optimizations/{key}` | 查询（重规划作业同样用此路径）；RUNNING→202，SUCCEEDED→200，FAILED→200 带 error |
+| POST | `/optimizations/{key}/cancel` | 请求取消（重规划作业同样用此路径）；运行中 202，否则 200 |
 
 详见 `docs/api.md`，交互式文档：服务启动后访问 `/docs`。
 
@@ -183,6 +192,86 @@ curl -s -X POST http://127.0.0.1:8000/optimizations \
 - `tests/test_solver.py`：可行性判定、容量/保底/守恒、超时 vs 取消、可复现；
 - `tests/test_idempotency.py`：20 路并发重复提交只求解一次、冲突、失败后重试使用全新取消事件；
 - `tests/test_service.py`：超时/取消后的重试不被污染、跨服务结果复现；
-- `tests/test_api.py`：端到端状态码分类、幂等、不可行原因、并发提交、跨场景约束一致性。
+- `tests/test_replan.py`：确认额度逐格锁定、412 冲突 / 400 非法 / 422
+  残量不可行三类区分、20 路并发重规划只算一次、接续谱系、原方案不被改写、
+  低精度紧边界成功结果严格达标否则拒绝；
+- `tests/test_api.py`：端到端状态码分类、幂等、不可行原因、并发提交、跨场景约束一致性、重规划接口。
 
 更多设计说明见 `docs/model.md`。
+
+---
+
+## 8. 带已确认额度的重规划（replan）
+
+### 8.1 适用场景
+
+第一版方案算出并**部分确认下发**后，需求、窗口容量或总供给发生变化。
+此时不希望重算全部，而是把已发出的额度锁死，只对剩余部分重新分配。
+
+### 8.2 与原有用法的兼容性
+
+- 重规划是**新增的独立入口** `POST /replans`，原有 `/optimizations`、
+  查询、取消、超时、失败重试等行为完全不变；
+- 重规划与普通提交共用同一个幂等存储与状态机（RUNNING/SUCCEEDED/FAILED），
+  查询走 `GET /optimizations/{key}`、取消走 `POST /optimizations/{key}/cancel`；
+- 成功响应在原有结构上**只新增字段**：顶层 `based_on_key`、每场景
+  `confirmed_total`，旧消费者不受影响；
+- 被接续的既有方案永不被重规划改写。
+
+### 8.3 请求要点
+
+- `based_on_key`：接续的**已成功**方案键；
+- `confirmed_allocations[]`：每条为
+  `{scenario, entity, window, amount}`，表示该格子已确认下发、必须原样保留；
+  不能确认超过既有方案在该格子实发量的额度；
+- `entities/windows/scenarios/quantize_decimals`：**最新**输入（可与旧方案不同）；
+- 确认额度与 `total_supply` 必须落在量化网格上（量子
+  `10^-quantize_decimals` 的整数倍），否则用更高精度。
+
+### 8.4 成功与失败
+
+- 成功：所有场景容量上限 / 最小保障 / 需求上限 / 总量守恒严格成立，
+  每个确认格子逐格等于确认量；
+- `412 CONFIRMED_CONFLICT`：确认额度与最新输入冲突（窗口装不下 /
+  实体超当前上限 / 确认总量超供给），原因精确到场景/实体/窗口；
+- `422 INFEASIBLE`：输入与锁都合法，但锁定后残量整体无解；
+- `400 INVALID_REQUEST`：结构/引用非法或当前精度网格不可行。
+失败整体发生，无半成品、不改锁。
+
+### 8.5 调用示例
+
+```bash
+# 1) 先有一份成功方案 demo-1
+curl -s -X POST http://127.0.0.1:8000/optimizations \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: demo-1' \
+  -d '{
+    "entities":[{"name":"a","base_demand":100,"min_share":10},
+                {"name":"b","base_demand":50,"min_share":5}],
+    "windows":[{"name":"w1","capacity":80},{"name":"w2","capacity":80}],
+    "scenarios":[{"name":"base","total_supply":120,"is_baseline":true},
+                 {"name":"up","total_supply":100,"demand_multipliers":{"a":1.5}}]
+  }'
+
+# 2) 确认 base 场景 a@w1=30 后，用最新输入重规划（如窗口容量有调整）
+curl -s -X POST http://127.0.0.1:8000/replans \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: demo-1-replan' \
+  -d '{
+    "based_on_key":"demo-1",
+    "entities":[{"name":"a","base_demand":100,"min_share":10},
+                {"name":"b","base_demand":50,"min_share":5}],
+    "windows":[{"name":"w1","capacity":70},{"name":"w2","capacity":90}],
+    "scenarios":[{"name":"base","total_supply":120,"is_baseline":true},
+                 {"name":"up","total_supply":100,"demand_multipliers":{"a":1.5}}],
+    "confirmed_allocations":[
+      {"scenario":"base","entity":"a","window":"w1","amount":30}
+    ]
+  }'
+```
+
+### 8.6 本地验证重规划
+
+```bash
+uv run pytest tests/test_replan.py -q
+uv run pytest tests/test_api.py::test_replan_endpoint_preserves_locks_and_tracks_lineage -q
+uv run pytest -q --log-cli-level=INFO   # 查看“锁定…/412/422/校验通过”判定日志
+```
