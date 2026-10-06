@@ -19,6 +19,7 @@ from collections.abc import Callable
 
 from app.errors import (
     CancelledError,
+    ConfirmationConflictError,
     InfeasibleError,
     InvalidRequestError,
     SolverFailureError,
@@ -32,7 +33,14 @@ from app.solver.models import (
     SolveResult,
     WindowAllocation,
 )
-from app.solver.validate import check_feasibility, scenario_demand, validate_problem
+from app.solver.validate import (
+    check_feasibility,
+    check_locked_conflicts,
+    locked_col_sums,
+    locked_row_sums,
+    scenario_demand,
+    validate_problem,
+)
 
 logger = get_logger("app.solver.engine")
 
@@ -98,6 +106,19 @@ def solve(
             details={"reasons": infeasible},
         )
 
+    locked_conflicts = check_locked_conflicts(problem)
+    if locked_conflicts:
+        # 确认额度与最新输入冲突：与输入非法、整体不可行严格区分，
+        # 绝不悄悄改动确认额度来凑出"能用"的结果。
+        logger.warning(
+            "已确认额度与最新输入冲突，拒绝重规划，共 %d 条原因",
+            len(locked_conflicts),
+        )
+        raise ConfirmationConflictError(
+            "已确认额度与最新输入冲突，无法在保留确认额度的前提下完成重规划",
+            details={"reasons": locked_conflicts},
+        )
+
     grid_issues = _check_grid_feasibility(problem, quantize_decimals)
     if grid_issues:
         logger.warning("量化网格不可行（decimals=%d）: %s", quantize_decimals, grid_issues)
@@ -134,16 +155,33 @@ def _check_grid_feasibility(problem: AllocationProblem, decimals: int) -> list[s
 
     在选定小数位下，容量 floor、保底 ceil、供给/需求 round 后必须仍存在
     合法整数方案，否则应在求解前明确拒绝，而不是产生半成品。
+    已确认额度必须能精确落在网格上，且其列合计不得击穿量化后容量。
     """
     scale = 10**decimals
     cap_units = [int(w.capacity * scale + 1e-6) for w in problem.windows]
     total_cap = sum(cap_units)
     issues: list[str] = []
 
+    locked_units = _locked_units_or_issues(problem, scale, issues)
+    locked_rows_u = {e.name: 0 for e in problem.entities}
+    locked_cols_u = {w.name: 0 for w in problem.windows}
+    for (entity, window), u in locked_units.items():
+        locked_rows_u[entity] += u
+        locked_cols_u[window] += u
+    for w in problem.windows:
+        if locked_cols_u[w.name] > cap_units_by_name(problem, scale)[w.name]:
+            issues.append(
+                f"window '{w.name}': 已确认量量化后 {locked_cols_u[w.name]} 单位 "
+                f"超过容量量化上限"
+            )
+
     for s in problem.scenarios:
         demands = scenario_demand(problem, s)
         supply_u = int(round(s.total_supply * scale))
-        ceil_min = sum(_ceil_units(e.min_share, scale) for e in problem.entities)
+        ceil_min = sum(
+            max(_ceil_units(e.min_share, scale), locked_rows_u[e.name])
+            for e in problem.entities
+        )
         floor_demand = sum(int(demands[e.name] * scale + 1e-6) for e in problem.entities)
 
         if supply_u > total_cap:
@@ -162,7 +200,9 @@ def _check_grid_feasibility(problem: AllocationProblem, decimals: int) -> list[s
                 f"{floor_demand} 单位"
             )
         for e in problem.entities:
-            ceil_min_e = _ceil_units(e.min_share, scale)
+            ceil_min_e = max(
+                _ceil_units(e.min_share, scale), locked_rows_u[e.name]
+            )
             floor_dem_e = int(demands[e.name] * scale + 1e-6)
             if ceil_min_e > floor_dem_e:
                 issues.append(
@@ -170,6 +210,29 @@ def _check_grid_feasibility(problem: AllocationProblem, decimals: int) -> list[s
                     f"{ceil_min_e} 单位高于扰动需求上限 {floor_dem_e} 单位"
                 )
     return issues
+
+
+def cap_units_by_name(problem: AllocationProblem, scale: int) -> dict[str, int]:
+    return {w.name: int(w.capacity * scale + 1e-6) for w in problem.windows}
+
+
+def _locked_units_or_issues(
+    problem: AllocationProblem, scale: int, issues: list[str]
+) -> dict[tuple[str, str], int]:
+    """把已确认额度换算为网格整数单位；无法精确表示时记录问题（按参数问题拒绝）。"""
+    units: dict[tuple[str, str], int] = {}
+    for cell, amount in problem.locked.items():
+        exact = amount * scale
+        rounded = int(round(exact))
+        if abs(exact - rounded) > 1e-6:
+            issues.append(
+                f"entity '{cell[0]}' window '{cell[1]}': 已确认量 {amount} "
+                f"无法在 {len(str(scale)) - 1} 位小数网格上精确表示，"
+                "请提高 quantize_decimals"
+            )
+            continue
+        units[cell] = rounded
+    return units
 
 
 def _ceil_units(x: float, scale: int) -> int:
@@ -181,12 +244,19 @@ def _ceil_units(x: float, scale: int) -> int:
 def _solve_scenario(problem, scenario, *, decimals: int, gate: _ControlGate) -> ScenarioResult:
     demands = scenario_demand(problem, scenario)
     supply = scenario.total_supply
+    locked_rows = locked_row_sums(problem)
+    # 实体下限 = max(最小保障, 该实体已确认总量)：确认额度原样保留，
+    # 未确认部分才参与重排。
+    lower_bounds = {
+        e.name: max(e.min_share, locked_rows[e.name]) for e in problem.entities
+    }
     logger.info(
-        "求解场景 scenario=%s baseline=%s supply=%.6f demands=%s",
+        "求解场景 scenario=%s baseline=%s supply=%.6f demands=%s locked_cells=%d",
         scenario.name,
         scenario.is_baseline,
         supply,
         {k: round(v, 6) for k, v in demands.items()},
+        len(problem.locked),
     )
 
     # ---- 第一步：实体层水位填充 ----
@@ -194,7 +264,7 @@ def _solve_scenario(problem, scenario, *, decimals: int, gate: _ControlGate) -> 
     entity_amounts = _allocate_entities(
         names=[e.name for e in problem.entities],
         demands=demands,
-        min_shares={e.name: e.min_share for e in problem.entities},
+        lower_bounds=lower_bounds,
         supply=supply,
     )
     logger.info(
@@ -203,16 +273,17 @@ def _solve_scenario(problem, scenario, *, decimals: int, gate: _ControlGate) -> 
         {k: round(v, 6) for k, v in entity_amounts.items()},
     )
 
-    # ---- 第二步：窗口层整数网格装箱（含量化与守恒修补）----
+    # ---- 第二步：窗口层整数网格装箱（含量化与守恒修补，锁定格子预置）----
     gate.check(f"windows:{scenario.name}")
     matrix = _quantize_and_repair(
         names_e=[e.name for e in problem.entities],
         names_w=[w.name for w in problem.windows],
         capacities={w.name: w.capacity for w in problem.windows},
         target_totals=entity_amounts,
-        bounds={e.name: (e.min_share, demands[e.name]) for e in problem.entities},
+        bounds={e.name: (lower_bounds[e.name], demands[e.name]) for e in problem.entities},
         supply=supply,
         decimals=decimals,
+        locked=problem.locked,
     )
 
     result = _assemble(
@@ -228,7 +299,7 @@ def _solve_scenario(problem, scenario, *, decimals: int, gate: _ControlGate) -> 
         matrix=matrix,
     )
 
-    violations = _verify(result, decimals)
+    violations = _verify(result, decimals, locked=problem.locked)
     if violations:
         raise SolverFailureError(
             f"场景 '{scenario.name}' 求解结果未通过内部约束校验",
@@ -242,11 +313,11 @@ def _allocate_entities(
     *,
     names: list[str],
     demands: dict[str, float],
-    min_shares: dict[str, float],
+    lower_bounds: dict[str, float],
     supply: float,
 ) -> dict[str, float]:
-    """先保底、后水位填充，输出各实体分配量（浮点）。"""
-    amounts = {n: min_shares[n] for n in names}
+    """先满足各实体下限（保底与已确认量的较大者）、后水位填充，输出各实体分配量。"""
+    amounts = {n: lower_bounds[n] for n in names}
     remaining = supply - sum(amounts.values())
     if remaining < -_EPS:  # 已由可行性检查拦截，此处为防御
         raise SolverFailureError("保底后剩余供给为负")
@@ -292,24 +363,44 @@ def _quantize_and_repair(
     bounds: dict[str, tuple[float, float]],
     supply: float,
     decimals: int,
+    locked: dict[tuple[str, str], float] | None = None,
 ) -> dict[tuple[str, str], float]:
     """纯整数网格量化与修补。
 
     所有格子取值均为量子 q=10**-decimals 的非负整数倍：
     - 列容量上限 U_w = floor(capacity_w / q)；
     - 行目标 T_e（行单位合计对齐 round(supply/q)，保证总量守恒）；
-    - 行下限 L_e = floor(min_share_e / q)（保底，绝不向下击穿）。
+    - 行下限 L_e = ceil(下限_e / q)（保底/已确认行合计，绝不向下击穿）；
+    - 已确认格子按精确单位预置进矩阵，再从剩余行/列余量中贪心分配。
     逐行贪心分配（实体外层、窗口内层），可行性已保证存在合法整数方案。
     """
     quantum = 10**-decimals
     scale = 10**decimals
+    locked = locked or {}
 
     col_cap = {w: int(capacities[w] * scale + 1e-6) for w in names_w}
-    floor_units = {e: int(bounds[e][0] * scale + 1e-6) for e in names_e}
     ceil_units = {e: int(bounds[e][1] * scale + 1e-6) for e in names_e}
+
+    # 已确认格子换算为精确整数单位（可表示性已在网格预检中判定）。
+    locked_units = {cell: int(round(v * scale)) for cell, v in locked.items()}
+    locked_row_u = {e: 0 for e in names_e}
+    locked_col_u = {w: 0 for w in names_w}
+    for (e, w), u in locked_units.items():
+        locked_row_u[e] += u
+        locked_col_u[w] += u
+
+    # 行下限：ceil 保证严格 >= 下限（成功结果必须真实达标）；
+    # 与已确认行合计取较大者，确认额度绝不被击穿。
+    floor_units = {
+        e: max(_ceil_units(bounds[e][0], scale), locked_row_u[e]) for e in names_e
+    }
 
     # 行目标（整数单位），随后把合计对齐到供给的整数单位。
     targets = {e: int(round(target_totals[e] / quantum)) for e in names_e}
+    # 浮点求和抖动可能使 round 后略低于行下限，先钳回下限再统一调整。
+    for e in names_e:
+        if targets[e] < floor_units[e]:
+            targets[e] = floor_units[e]
     supply_units = int(round(supply / quantum))
 
     # 缺口摊派严格落在 [保底, 需求上限] 内：
@@ -339,11 +430,17 @@ def _quantize_and_repair(
 
     col_used = {w: 0 for w in names_w}
     units: dict[tuple[str, str], int] = {}
+    # 已确认格子原样预置：这些量不再参与后续分配。
+    for cell, u in locked_units.items():
+        if u > 0:
+            units[cell] = u
     # 列水位填充：外层窗口（逐列填满到 floor 容量上限），内层实体按固定顺序。
     # 总供给 <= 列容量合计（可行性已保证），因此必定能装完且不产生碎片失败。
-    row_left = dict(targets)
+    row_left = {e: targets[e] - locked_row_u[e] for e in names_e}
     for w in names_w:
-        room = col_cap[w]
+        room = col_cap[w] - locked_col_u[w]
+        if room < 0:  # 已由网格预检拦截，此处为防御
+            raise SolverFailureError(f"窗口 '{w}' 已确认量超过量化容量")
         for e in names_e:
             if room == 0:
                 break
@@ -351,7 +448,7 @@ def _quantize_and_repair(
                 continue
             take = min(row_left[e], room)
             if take > 0:
-                units[(e, w)] = take
+                units[(e, w)] = units.get((e, w), 0) + take
                 row_left[e] -= take
                 room -= take
         col_used[w] = col_cap[w] - room
@@ -412,8 +509,13 @@ def _assemble(
     )
 
 
-def _verify(result: ScenarioResult, decimals: int) -> list[str]:
-    """对最终结果做独立约束校验（容量/最小保障/总量守恒）。"""
+def _verify(
+    result: ScenarioResult,
+    decimals: int,
+    *,
+    locked: dict[tuple[str, str], float] | None = None,
+) -> list[str]:
+    """对最终结果做独立约束校验（容量/最小保障/总量守恒/确认额度保留）。"""
     tol = 2 * 10**-decimals
     violations: list[str] = []
 
@@ -442,5 +544,21 @@ def _verify(result: ScenarioResult, decimals: int) -> list[str]:
     window_sum = round(sum(wa.allocated for wa in result.window_allocations), 12)
     if abs(entity_sum - window_sum) > tol:
         violations.append(f"实体侧与窗口侧合计不一致: {entity_sum} != {window_sum}")
+
+    # 已确认额度：对应格子最终值不得少于确认量（确认部分必须原样保留在其中）。
+    for (entity, window), amount in (locked or {}).items():
+        cell = next(
+            (
+                wa.entities.get(entity, 0.0)
+                for wa in result.window_allocations
+                if wa.window == window
+            ),
+            0.0,
+        )
+        if cell < amount - 1e-9:
+            violations.append(
+                f"确认额度未被保留: entity '{entity}' window '{window}' "
+                f"确认 {amount} 实际 {cell}"
+            )
 
     return violations

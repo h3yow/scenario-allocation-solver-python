@@ -10,6 +10,7 @@ class ErrorCode:
     INVALID_REQUEST = "INVALID_REQUEST"
     INFEASIBLE = "INFEASIBLE"
     CONFLICT = "CONFLICT"
+    CONFIRMATION_CONFLICT = "CONFIRMATION_CONFLICT"
     TIMEOUT = "TIMEOUT"
     CANCELLED = "CANCELLED"
     SOLVER_FAILURE = "SOLVER_FAILURE"
@@ -41,6 +42,13 @@ class InfeasibleError(AppError):
 
 class ConflictError(AppError):
     code = ErrorCode.CONFLICT
+    http_status = 409
+
+
+class ConfirmationConflictError(AppError):
+    """已确认额度与最新输入（容量/需求上限/供给）冲突，区别于输入非法与整体不可行。"""
+
+    code = ErrorCode.CONFIRMATION_CONFLICT
     http_status = 409
 
 

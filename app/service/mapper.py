@@ -7,6 +7,7 @@ from app.models import (
     EntityOut,
     OptimizeRequest,
     OptimizeResponse,
+    ReplanRequest,
     ScenarioOut,
     WindowOut,
 )
@@ -47,10 +48,42 @@ def request_to_problem(request: OptimizeRequest) -> AllocationProblem:
     return problem
 
 
+def replan_request_to_problem(request: ReplanRequest) -> AllocationProblem:
+    """把重规划请求转换为带已确认额度（locked）的求解器问题。"""
+    base = request_to_problem(
+        OptimizeRequest(
+            entities=request.entities,
+            windows=request.windows,
+            scenarios=request.scenarios,
+            timeout_seconds=request.timeout_seconds,
+            quantize_decimals=request.quantize_decimals,
+            solver_step_delay=request.solver_step_delay,
+        )
+    )
+    locked: dict[tuple[str, str], float] = {}
+    for c in request.confirmations:
+        key = (c.entity, c.window)
+        locked[key] = locked.get(key, 0.0) + c.amount
+    problem = AllocationProblem(
+        entities=base.entities,
+        windows=base.windows,
+        scenarios=base.scenarios,
+        locked=locked,
+    )
+    logger.info(
+        "重规划请求转换: base_key=%s 确认格子=%d",
+        request.base_key,
+        len(locked),
+    )
+    return problem
+
+
 def build_response(
     key: str,
     fingerprint: str,
     result: SolveResult,
+    *,
+    base_key: str | None = None,
 ) -> OptimizeResponse:
     """把求解结果装配为幂等固化的响应（不含易变的时间/线程信息）。"""
     scenarios: list[ScenarioOut] = []
@@ -91,6 +124,7 @@ def build_response(
         request_fingerprint=fingerprint,
         quantize_decimals=result.quantize_decimals,
         scenarios=scenarios,
+        base_key=base_key,
     )
-    logger.info("装配响应 key=%s 场景数=%d", key, len(scenarios))
+    logger.info("装配响应 key=%s 场景数=%d base_key=%s", key, len(scenarios), base_key)
     return response

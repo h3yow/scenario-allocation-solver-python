@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 
 from app.errors import AppError, ConflictError, NotFoundError
 from app.logging_setup import get_logger
-from app.models import OptimizeRequest, OptimizeResponse
+from app.models import OptimizeRequest, OptimizeResponse, ReplanRequest
 from app.service.idempotency import JobStatus
 from app.service.optimizer import OptimizerService
 
@@ -63,6 +63,36 @@ def build_router(service: OptimizerService) -> APIRouter:
                 "status": record.status.value,
                 "request_fingerprint": record.fingerprint,
                 "message": "作业已受理，使用 GET 查询结果",
+            },
+        )
+
+    @router.post("/replans", response_model=OptimizeResponse)
+    def submit_replan(
+        payload: ReplanRequest,
+        request: Request,
+        idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    ):
+        try:
+            outcome = service.submit_replan(idempotency_key.strip(), payload)
+        except ConflictError:
+            raise
+        record = outcome.record
+        if record.status is JobStatus.SUCCEEDED and record.result is not None:
+            logger.info(
+                "重规划幂等命中 key=%s base_key=%s 返回既有结果（等价请求）",
+                idempotency_key,
+                payload.base_key,
+            )
+            return record.result
+
+        return JSONResponse(
+            status_code=202,
+            content={
+                "idempotency_key": record.key,
+                "status": record.status.value,
+                "request_fingerprint": record.fingerprint,
+                "base_key": payload.base_key,
+                "message": "重规划作业已受理，使用 GET 查询结果",
             },
         )
 

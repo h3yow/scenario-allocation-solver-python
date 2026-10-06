@@ -37,6 +37,9 @@ class AllocationProblem:
     entities: list[EntitySpec]
     windows: list[WindowSpec]
     scenarios: list[Scenario]
+    # 已确认额度：(entity, window) -> 确认量。重规划时这些格子在所有场景下
+    # 必须原样保留，只允许重排未确认部分。普通优化为空。
+    locked: dict[tuple[str, str], float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

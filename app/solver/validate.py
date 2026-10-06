@@ -78,7 +78,112 @@ def validate_problem(problem: AllocationProblem) -> None:
                     f"scenario '{s.name}' entity '{entity_name}' 需求乘数必须为正，实际 {mult}",
                 )
 
+    _validate_locked(problem)
+
     logger.info("输入结构校验通过")
+
+
+def _validate_locked(problem: AllocationProblem) -> None:
+    """已确认额度的结构校验（非法 -> InvalidRequestError）。
+
+    冲突类问题（确认量与容量/需求/供给对不上）不在此处判定，
+    由 ``check_locked_conflicts`` 以 CONFIRMATION_CONFLICT 单独报告。
+    """
+    if not problem.locked:
+        return
+    entity_names = {e.name for e in problem.entities}
+    window_names = {w.name for w in problem.windows}
+    for (entity, window), amount in problem.locked.items():
+        if entity not in entity_names:
+            raise InvalidRequestError(
+                f"已确认额度引用了未知 entity '{entity}'",
+                details={"entity": entity, "window": window},
+            )
+        if window not in window_names:
+            raise InvalidRequestError(
+                f"已确认额度引用了未知 window '{window}'",
+                details={"entity": entity, "window": window},
+            )
+        if amount <= 0:
+            raise InvalidRequestError(
+                f"已确认额度必须为正: entity '{entity}' window '{window}' amount={amount}",
+                details={"entity": entity, "window": window, "amount": amount},
+            )
+
+
+def locked_row_sums(problem: AllocationProblem) -> dict[str, float]:
+    """每个实体的已确认总量（跨窗口求和）。"""
+    rows: dict[str, float] = {e.name: 0.0 for e in problem.entities}
+    for (entity, _window), amount in problem.locked.items():
+        rows[entity] = rows.get(entity, 0.0) + amount
+    return rows
+
+
+def locked_col_sums(problem: AllocationProblem) -> dict[str, float]:
+    """每个窗口的已确认总量（跨实体求和）。"""
+    cols: dict[str, float] = {w.name: 0.0 for w in problem.windows}
+    for (_entity, window), amount in problem.locked.items():
+        cols[window] = cols.get(window, 0.0) + amount
+    return cols
+
+
+def check_locked_conflicts(problem: AllocationProblem) -> list[str]:
+    """已确认额度与最新输入的冲突检测；为空表示无冲突。
+
+    逐条指明场景/实体/窗口，与 INFEASIBLE（输入本身不可行）严格区分：
+    只有在去掉确认额度后问题本身可行、但保留确认额度后不可行时，
+    才会走到这里报告冲突。
+    """
+    if not problem.locked:
+        return []
+    reasons: list[str] = []
+    rows = locked_row_sums(problem)
+    cols = locked_col_sums(problem)
+    total_locked = sum(problem.locked.values())
+
+    # 窗口容量是跨场景共享的：确认量超过容量在所有场景都装不下。
+    for w in problem.windows:
+        if cols[w.name] > w.capacity + EPS:
+            reason = (
+                f"window '{w.name}': 已确认量 {_fmt(cols[w.name])} 超过窗口容量 "
+                f"{_fmt(w.capacity)}（所有场景均装不下）"
+            )
+            logger.info("确认额度冲突: %s", reason)
+            reasons.append(reason)
+
+    for s in problem.scenarios:
+        demands = scenario_demand(problem, s)
+        for e in problem.entities:
+            locked_row = rows[e.name]
+            if locked_row > demands[e.name] + EPS:
+                reason = (
+                    f"scenario '{s.name}': entity '{e.name}' 已确认量 "
+                    f"{_fmt(locked_row)} 超过其当前需求上限 {_fmt(demands[e.name])}"
+                )
+                logger.info("确认额度冲突: %s", reason)
+                reasons.append(reason)
+
+        # 每个实体至少要拿 max(保底, 已确认行合计)，合计不得超过场景供给。
+        min_required = sum(
+            max(e.min_share, rows[e.name]) for e in problem.entities
+        )
+        if min_required > s.total_supply + EPS:
+            reason = (
+                f"scenario '{s.name}': 保底与已确认量合计 {_fmt(min_required)} "
+                f"超过总供给 {_fmt(s.total_supply)}，确认额度无法原样保留"
+            )
+            logger.info("确认额度冲突: %s", reason)
+            reasons.append(reason)
+
+        if total_locked > s.total_supply + EPS:
+            reason = (
+                f"scenario '{s.name}': 已确认总量 {_fmt(total_locked)} "
+                f"超过总供给 {_fmt(s.total_supply)}，总量守恒无法成立"
+            )
+            logger.info("确认额度冲突: %s", reason)
+            reasons.append(reason)
+
+    return reasons
 
 
 def scenario_demand(problem: AllocationProblem, scenario) -> dict[str, float]:

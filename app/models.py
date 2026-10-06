@@ -32,6 +32,27 @@ class OptimizeRequest(BaseModel):
     solver_step_delay: float = Field(default=0.0, ge=0)
 
 
+class ConfirmationIn(BaseModel):
+    """一笔已确认额度：实体 entity 在窗口 window 上已确认下发的量。"""
+
+    entity: str
+    window: str
+    amount: float = Field(gt=0)
+
+
+class ReplanRequest(BaseModel):
+    """带已确认额度的重规划：接着 base_key 指向的成功方案，锁定确认格子后重排。"""
+
+    base_key: str = Field(min_length=1)
+    confirmations: list[ConfirmationIn] = Field(default_factory=list)
+    entities: list[EntityIn]
+    windows: list[WindowIn]
+    scenarios: list[ScenarioIn]
+    timeout_seconds: float | None = Field(default=None, gt=0)
+    quantize_decimals: int = Field(default=9, ge=0, le=12)
+    solver_step_delay: float = Field(default=0.0, ge=0)
+
+
 class EntityOut(BaseModel):
     entity: str
     demand: float
@@ -65,3 +86,5 @@ class OptimizeResponse(BaseModel):
     request_fingerprint: str
     quantize_decimals: int
     scenarios: list[ScenarioOut]
+    # 重规划结果指向其延续的既有方案；普通优化为 null。
+    base_key: str | None = None

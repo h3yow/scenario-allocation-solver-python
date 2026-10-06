@@ -2,7 +2,8 @@
 
 本地化的**多场景滚动窗口资源分配优化**服务。同一批需求在
 正常 / 不可行 / 并发重复提交 / 求解超时 / 主动取消等情况下，都得到
-一致、可复现、可解释的结果。纯本地运行，不依赖外部优化求解器。
+一致、可复现、可解释的结果；方案下发后可锁定已确认额度做**重规划**，
+只重排未确认部分。纯本地运行，不依赖外部优化求解器。
 
 - Web 框架：FastAPI（Pydantic v2）
 - Python：>=3.14.4，依赖管理：uv
@@ -71,7 +72,35 @@ demand_s(e) = base_demand(e) * demand_multipliers_s.get(e, 1.0)
 
 ---
 
-## 2. 状态机与幂等语义
+## 2. 带已确认额度的重规划
+
+方案下发后，运营上常先确认其中一部分额度（已对外承诺、不可再动），之后
+需求或窗口容量变动时只重排未确认部分。`POST /replans` 在一份**已成功**
+方案的基础上完成这件事：
+
+- 请求在常规输入之上增加 `base_key`（延续的既有方案）与
+  `confirmations[]`（`(entity, window, amount)` 确认格子，必须来自基准
+  方案基线场景的既有分配且不超过原分配量）；
+- 重规划结果的**所有场景**（基线与扰动同口径）中，确认格子最终值不低于
+  确认量——确认部分不会被重新分配、挪走或变少，未确认部分按最新需求、
+  窗口容量与总供给重排；容量上限、最小保障、需求上限、总量守恒继续严格
+  成立；
+- 响应带 `base_key` 血缘字段；重规划指纹绑定基准方案与确认额度，同一
+  重规划标识并发/重复提交只真正计算一次，返回同一份等价结果；
+- 确认额度与最新输入冲突（窗口装不下、确认量超过实体当前需求上限、
+  确认总量超过供给等）时整体失败为 `CONFIRMATION_CONFLICT`，
+  `details.reasons` 逐条指明场景/实体/窗口，与 `INVALID_REQUEST`、
+  `INFEASIBLE` 严格区分；绝不悄悄改动确认额度来凑出"能用"的结果；
+- 成功结果严格达标：保底/确认量按 `ceil` 上网格（零容差不击穿），
+  精度不足时明确按 `INVALID_REQUEST`/`INFEASIBLE` 拒绝，不返回表面成功；
+- 基准方案（SUCCEEDED）永久固化，重规划不会修改它；查询、取消、超时、
+  失败重试语义与普通优化完全一致（共用同一作业存储与接口）。
+
+模型细节见 `docs/model.md` 第 7 节，接口契约见 `docs/api.md`。
+
+---
+
+## 3. 状态机与幂等语义
 
 ### 2.1 作业状态
 
@@ -99,13 +128,14 @@ demand_s(e) = base_demand(e) * demand_multipliers_s.get(e, 1.0)
 
 ---
 
-## 3. 异常分类
+## 4. 异常分类
 
 | code | HTTP | 触发条件 | 可重试 |
 | --- | --- | --- | --- |
 | `INVALID_REQUEST` | 400 | 结构/取值非法（空实体、重名、非唯一基线、负值、未知实体引用、量化网格不可行等） | 修改输入 |
 | `INFEASIBLE` | 422 | 输入合法但优化不可行，`details.reasons` 列出每条原因 | 修改输入 |
 | `CONFLICT` | 409 | 同幂等键绑定了不同请求指纹 | 更换键或保持同体 |
+| `CONFIRMATION_CONFLICT` | 409 | 重规划中已确认额度与基准方案或最新输入（容量/需求上限/供给）冲突，`details.reasons` 指明场景/实体/窗口 | 调整确认额度或输入 |
 | `TIMEOUT` | 504 | 求解超过 `timeout_seconds` | 同键同指纹可重试 |
 | `CANCELLED` | 499 | 作业在运行中被主动取消 | 同键同指纹可重试 |
 | `SOLVER_FAILURE` | 500 | 求解器内部错误（含结果未通过内部约束校验） | 同键同指纹可重试 |
@@ -125,7 +155,7 @@ demand_s(e) = base_demand(e) * demand_multipliers_s.get(e, 1.0)
 
 ---
 
-## 4. 配置项
+## 5. 配置项
 
 | 配置 | 位置 | 默认 | 说明 |
 | --- | --- | --- | --- |
@@ -138,11 +168,12 @@ demand_s(e) = base_demand(e) * demand_multipliers_s.get(e, 1.0)
 
 ---
 
-## 5. HTTP 接口
+## 6. HTTP 接口
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/optimizations`（头 `Idempotency-Key`） | 提交；首次 202，已完成的重复提交 200 |
+| POST | `/replans`（头 `Idempotency-Key`） | 带已确认额度的重规划；语义同上，结果带 `base_key` 血缘 |
 | GET | `/optimizations/{key}` | 查询；RUNNING→202，SUCCEEDED→200，FAILED→200 带 error |
 | POST | `/optimizations/{key}/cancel` | 请求取消；运行中 202，否则 200 |
 
@@ -150,7 +181,7 @@ demand_s(e) = base_demand(e) * demand_multipliers_s.get(e, 1.0)
 
 ---
 
-## 6. 本地验证
+## 7. 本地验证
 
 ```bash
 # 安装依赖（首次会创建 .venv）
@@ -178,11 +209,30 @@ curl -s -X POST http://127.0.0.1:8000/optimizations \
   }'
 ```
 
+重规划示例（接着上面的 `demo-1`，确认 `a` 在 `w1` 的 30 单位后按新供给重排）：
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/replans \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: replan-1' \
+  -d '{
+    "base_key": "demo-1",
+    "confirmations": [{"entity":"a","window":"w1","amount":30}],
+    "entities":[{"name":"a","base_demand":100,"min_share":10},
+                {"name":"b","base_demand":50,"min_share":5}],
+    "windows":[{"name":"w1","capacity":80},{"name":"w2","capacity":80}],
+    "scenarios":[{"name":"base","total_supply":100,"is_baseline":true},
+                 {"name":"up","total_supply":90,"demand_multipliers":{"a":1.5}}]
+  }'
+# 查询/取消与 /optimizations 相同：GET /optimizations/replan-1
+```
+
 ### 测试覆盖
 
 - `tests/test_solver.py`：可行性判定、容量/保底/守恒、超时 vs 取消、可复现；
 - `tests/test_idempotency.py`：20 路并发重复提交只求解一次、冲突、失败后重试使用全新取消事件；
 - `tests/test_service.py`：超时/取消后的重试不被污染、跨服务结果复现；
-- `tests/test_api.py`：端到端状态码分类、幂等、不可行原因、并发提交、跨场景约束一致性。
+- `tests/test_api.py`：端到端状态码分类、幂等、不可行原因、并发提交、跨场景约束一致性、重规划端到端与错误分类；
+- `tests/test_replan.py`：确认格子保留与未确认部分重排、确认额度冲突分类、
+  基准方案校验、并发重规划只求解一次、低精度严格达标/明确拒绝、取消语义沿用。
 
 更多设计说明见 `docs/model.md`。
